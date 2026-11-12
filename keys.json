@@ -1,0 +1,5 @@
+{
+  "layout:main-ports": {
+    "ctrl-shift-r": "tabs-ports.ports"
+  }
+}

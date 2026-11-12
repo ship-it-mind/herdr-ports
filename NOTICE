@@ -1,0 +1,12 @@
+Ports for Herdr
+Copyright 2026 Ahmed Sultan
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This project includes modified copies of files from Herdr (https://github.com/herdrdev/herdr-app),
+licensed under the Apache License, Version 2.0:
+
+- layouts/main-ports.json is Herdr 0.1.15's `main` layout (defaults/layouts/main.json), cloned with
+  `layout.clone`, with the tab bar pointed at `tabs-ports` and a `ports` block added to the side panel.
+- mods/tabs-ports/ is Herdr 0.1.15's `tabs` mod (defaults/mods/tabs), cloned with `mod.clone`.
+  Every change is marked with a `// herdr-ports:` comment. Its window-button icons are Herdr's, unchanged.

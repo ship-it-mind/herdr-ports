@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# A throwaway Herdr app with its own core, app home and X display, plus a
+# Docker container with sshd that it knows as the machine `box`. Your real
+# Herdr window, core, machines and ~/.ssh files are never touched.
+#
+#   scripts/sandbox up        start the box, the display, the core and the window; add `box`
+#   scripts/sandbox down      stop everything and delete it
+#   scripts/sandbox install   copy the main-ports layout and its two mods into the sandbox's app home
+#   scripts/sandbox env       print the exports, to run herdr-app / hc against the sandbox
+#   scripts/sandbox shot [f]  screenshot of the window
+#   scripts/sandbox click X Y left-click at screen pixels (XTest)
+#   scripts/sandbox type T..  type text; [Return] and [Escape] press keys
+#   scripts/sandbox box CMD   run a command in the box (as dev)
+#   scripts/sandbox opened    links the window asked to open (logged, never opened)
+#   scripts/sandbox log       the window's log
+set -euo pipefail
+
+here=$(cd "$(dirname "$0")/.." && pwd)
+root=/var/tmp/herdr-ports-sandbox
+display=:77
+box=herdr-ports-box
+box_port=2222
+
+export HC_SESSION=herdr-ports-sbx HERDR_APP_HOME=$root/home XDG_STATE_HOME=$root/state
+export HERDR_APP_NO_SOUND=1 DISPLAY=$display WAYLAND_DISPLAY=
+export PATH=$root/bin:$PATH
+
+ours() { { tr '\0' '\n' <"/proc/$1/environ"; } 2>/dev/null | grep -qx "HERDR_APP_HOME=$HERDR_APP_HOME"; }
+
+start_box() {
+  if docker ps --format '{{.Names}}' | grep -qx "$box"; then return 0; fi
+  docker rm -f "$box" >/dev/null 2>&1 || true
+  mkdir -p "$root/box"
+  ssh-add -L >"$root/box/authorized_keys"
+  cat >"$root/box/Dockerfile" <<'EOF'
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-server iproute2 procps python3 && rm -rf /var/lib/apt/lists/*
+RUN useradd -m -s /bin/bash dev && mkdir -p /run/sshd /home/dev/.ssh
+COPY authorized_keys /home/dev/.ssh/authorized_keys
+RUN chown -R dev:dev /home/dev/.ssh && chmod 700 /home/dev/.ssh && chmod 600 /home/dev/.ssh/authorized_keys
+CMD ["/usr/sbin/sshd", "-D", "-e"]
+EOF
+  docker build -q -t herdr-ports-box "$root/box" >/dev/null
+  docker run -d --name "$box" -p 127.0.0.1:$box_port:22 herdr-ports-box >/dev/null
+  # `hc machine add` only offers to install hc there when run at a terminal:
+  # put this hc where it looks (~/.local/bin/herdr-core, with hc beside it).
+  docker exec "$box" mkdir -p /home/dev/.local/bin
+  docker cp -L "$(command -v hc)" "$box:/home/dev/.local/bin/herdr-core"
+  docker exec "$box" sh -c 'ln -sf herdr-core /home/dev/.local/bin/hc && chown -R dev:dev /home/dev/.local'
+}
+
+wrap_tools() {
+  mkdir -p "$root/bin"
+  # ssh reads a private config, so `box` resolves and its host key lands in
+  # the sandbox, not in ~/.ssh/known_hosts.
+  cat >"$root/ssh_config" <<EOF
+Host box
+  HostName 127.0.0.1
+  Port $box_port
+  User dev
+  UserKnownHostsFile $root/known_hosts
+  StrictHostKeyChecking accept-new
+EOF
+  printf '#!/bin/sh\nexec /usr/bin/ssh -F %q "$@"\n' "$root/ssh_config" >"$root/bin/ssh"
+  # Opening a link would reach the real browser: log it instead.
+  for opener in xdg-open open; do
+    printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>%q\n' "$root/opened" >"$root/bin/$opener"
+  done
+  chmod +x "$root/bin/"*
+}
+
+start_display() {
+  if [[ -f $root/xpid ]] && kill -0 "$(cat "$root/xpid")" 2>/dev/null; then return 0; fi
+  Xvfb "$display" -screen 0 1400x900x24 -nolisten tcp >"$root/xvfb.log" 2>&1 &
+  echo $! >"$root/xpid"
+  for _ in $(seq 50); do xdpyinfo -display "$display" >/dev/null 2>&1 && return 0; sleep 0.1; done
+  echo "Xvfb did not start; see $root/xvfb.log" >&2; return 1
+}
+
+start_window() {
+  if [[ -f $root/pid ]] && ours "$(cat "$root/pid")"; then return 0; fi
+  mkdir -p "$HERDR_APP_HOME"
+  setsid herdr-app >"$root/app.log" 2>&1 </dev/null &
+  echo $! >"$root/pid"
+  for _ in $(seq 150); do
+    herdr-app status >/dev/null 2>&1 && { echo "sandbox window is up on $display (log: $root/app.log)"; return 0; }
+    ours "$(cat "$root/pid")" || { tail -20 "$root/app.log"; echo "sandbox window died" >&2; return 1; }
+    sleep 0.2
+  done
+  echo "sandbox window did not answer; see $root/app.log" >&2; return 1
+}
+
+install_mod() {
+  mkdir -p "$HERDR_APP_HOME/mods" "$HERDR_APP_HOME/layouts"
+  for m in ports tabs-ports; do
+    rm -rf "$HERDR_APP_HOME/mods/$m"
+    cp -r "$here/mods/$m" "$HERDR_APP_HOME/mods/$m"
+  done
+  cp "$here/layouts/main-ports.json" "$HERDR_APP_HOME/layouts/"
+}
+
+case ${1:-} in
+  up)
+    mkdir -p "$root"
+    wrap_tools
+    start_box
+    for _ in $(seq 50); do ssh -o BatchMode=yes box true 2>/dev/null && break; sleep 0.2; done
+    start_display
+    start_window
+    hc machine ls --json | grep -q '"name":"box"' || hc machine add box
+    ;;
+  down)
+    if [[ -f $root/pid ]] && ours "$(cat "$root/pid")"; then kill "$(cat "$root/pid")"; fi
+    hc server stop >/dev/null 2>&1 || true
+    if [[ -f $root/xpid ]]; then kill "$(cat "$root/xpid")" 2>/dev/null || true; fi
+    docker rm -f "$box" >/dev/null 2>&1 || true
+    rm -rf "$root"
+    echo "sandbox is gone"
+    ;;
+  install) install_mod ;;
+  env)
+    printf 'export HC_SESSION=%q HERDR_APP_HOME=%q XDG_STATE_HOME=%q HERDR_APP_NO_SOUND=1 DISPLAY=%q WAYLAND_DISPLAY= PATH=%q:$PATH\n' \
+      "$HC_SESSION" "$HERDR_APP_HOME" "$XDG_STATE_HOME" "$display" "$root/bin"
+    ;;
+  shot)
+    out=${2:-$root/shot.png}
+    import -display "$display" -window root "$out"
+    echo "$out"
+    ;;
+  click)
+    uv run -q --with python-xlib python - "$2" "$3" <<'EOF'
+import sys, time
+from Xlib import X, display
+from Xlib.ext import xtest
+d = display.Display()
+x, y = int(sys.argv[1]), int(sys.argv[2])
+xtest.fake_input(d, X.MotionNotify, x=x, y=y); d.sync(); time.sleep(0.5)
+xtest.fake_input(d, X.ButtonPress, 1); d.sync(); time.sleep(0.05)
+xtest.fake_input(d, X.ButtonRelease, 1); d.sync()
+EOF
+    ;;
+  type)
+    # Each argument is typed as text, except a key name in brackets: [Return], [Escape].
+    shift
+    uv run -q --with python-xlib python - "$@" <<'EOF'
+import sys, time
+from Xlib import X, XK, display
+from Xlib.ext import xtest
+d = display.Display()
+def tap(name):
+    code = d.keysym_to_keycode(XK.string_to_keysym(name))
+    xtest.fake_input(d, X.KeyPress, code); d.sync(); time.sleep(0.03)
+    xtest.fake_input(d, X.KeyRelease, code); d.sync(); time.sleep(0.03)
+for arg in sys.argv[1:]:
+    if arg.startswith("[") and arg.endswith("]"): tap(arg[1:-1])
+    else:
+        for ch in arg: tap(ch)
+EOF
+    ;;
+  box) shift; docker exec -u dev -w /home/dev "$box" "$@" ;;
+  opened) cat "$root/opened" 2>/dev/null || true ;;
+  log) cat "$root/app.log" ;;
+  *) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac
