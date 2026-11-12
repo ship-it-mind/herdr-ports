@@ -4,6 +4,7 @@
 # Herdr window, core, machines and ~/.ssh files are never touched.
 #
 #   scripts/sandbox up        start the box, the display, the core and the window; add `box`
+#                             (SANDBOX_SIZE=1600x1000 for preview shots: the gallery shows 16:10)
 #   scripts/sandbox down      stop everything and delete it
 #   scripts/sandbox install   copy the main-ports layout and its two mods into the sandbox's app home
 #   scripts/sandbox env       print the exports, to run herdr-app / hc against the sandbox
@@ -20,6 +21,8 @@ root=/var/tmp/herdr-ports-sandbox
 display=:77
 box=herdr-ports-box
 box_port=2222
+# SANDBOX_SIZE=1600x1000 sizes the display, and the window to fill it (for preview shots).
+size=${SANDBOX_SIZE:-1400x900}
 
 export HC_SESSION=herdr-ports-sbx HERDR_APP_HOME=$root/home XDG_STATE_HOME=$root/state
 export HERDR_APP_NO_SOUND=1 DISPLAY=$display WAYLAND_DISPLAY=
@@ -71,7 +74,7 @@ EOF
 
 start_display() {
   if [[ -f $root/xpid ]] && kill -0 "$(cat "$root/xpid")" 2>/dev/null; then return 0; fi
-  Xvfb "$display" -screen 0 1400x900x24 -nolisten tcp >"$root/xvfb.log" 2>&1 &
+  Xvfb "$display" -screen 0 "${size}x24" -nolisten tcp >"$root/xvfb.log" 2>&1 &
   echo $! >"$root/xpid"
   for _ in $(seq 50); do xdpyinfo -display "$display" >/dev/null 2>&1 && return 0; sleep 0.1; done
   echo "Xvfb did not start; see $root/xvfb.log" >&2; return 1
@@ -80,6 +83,9 @@ start_display() {
 start_window() {
   if [[ -f $root/pid ]] && ours "$(cat "$root/pid")"; then return 0; fi
   mkdir -p "$HERDR_APP_HOME"
+  if [[ -n ${SANDBOX_SIZE:-} ]]; then
+    printf '{"state":"normal","bounds":[0.0,0.0,%s.0,%s.0]}\n' "${size%x*}" "${size#*x}" >"$HERDR_APP_HOME/window.json"
+  fi
   setsid herdr-app >"$root/app.log" 2>&1 </dev/null &
   echo $! >"$root/pid"
   for _ in $(seq 150); do
@@ -88,6 +94,23 @@ start_window() {
     sleep 0.2
   done
   echo "sandbox window did not answer; see $root/app.log" >&2; return 1
+}
+
+# Without a window manager, Herdr opens at its own default size: set the window to fill the display.
+fit_window() {
+  uv run -q --with python-xlib python - "${size%x*}" "${size#*x}" <<'PY'
+import sys
+from Xlib import display
+d = display.Display(); w, h = int(sys.argv[1]), int(sys.argv[2])
+def walk(win):
+    try: name = win.get_wm_name()
+    except Exception: name = None
+    yield win, name
+    for c in win.query_tree().children: yield from walk(c)
+for win, name in walk(d.screen().root):
+    if name and "Herdr" in str(name): win.configure(x=0, y=0, width=w, height=h)
+d.sync()
+PY
 }
 
 install_mod() {
@@ -107,6 +130,7 @@ case ${1:-} in
     for _ in $(seq 50); do ssh -o BatchMode=yes box true 2>/dev/null && break; sleep 0.2; done
     start_display
     start_window
+    if [[ -n ${SANDBOX_SIZE:-} ]]; then sleep 1; fit_window; fi
     hc machine ls --json | grep -q '"name":"box"' || hc machine add box
     ;;
   down)
@@ -160,5 +184,5 @@ EOF
   box) shift; docker exec -u dev -w /home/dev "$box" "$@" ;;
   opened) cat "$root/opened" 2>/dev/null || true ;;
   log) cat "$root/app.log" ;;
-  *) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  *) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac
